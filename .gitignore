@@ -218,3 +218,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# NEXUS Generated Storage & Databases
+*.db
+nexus_storage.db
+backend/storage_data/
+storage_data/
+storage_bucket/
