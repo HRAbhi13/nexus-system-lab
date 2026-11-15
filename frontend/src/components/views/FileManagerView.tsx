@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import { 
   Search, 
   Upload, 
@@ -12,31 +12,81 @@ import {
   ArrowDown,
   ChevronLeft,
   ChevronRight,
-  RotateCcw
+  RotateCcw,
+  RefreshCw,
+  HardDrive
 } from 'lucide-react';
 import { StorageFile, FileCategory, StorageTier, SortField, SortDirection } from '../../types';
 import { TierBadge } from '../common/TierBadge';
 import { CategoryBadge } from '../common/CategoryBadge';
 import { FileDetailsModal } from '../common/FileDetailsModal';
 import { formatBytes } from '../../data/mockData';
+import { nexusApi, BackendFileMetadata } from '../../services/api';
 
 interface FileManagerViewProps {
-  files: StorageFile[];
+  files?: StorageFile[];
   onOpenUpload: () => void;
-  onDeleteFile: (fileId: string) => void;
-  onMigrateTier: (fileId: string, newTier: StorageTier) => void;
-  onBatchDeleteFiles: (fileIds: string[]) => void;
-  onBatchMigrateTier: (fileIds: string[], newTier: StorageTier) => void;
+  onDeleteFile?: (fileId: string) => void;
+  onMigrateTier?: (fileId: string, newTier: StorageTier) => void;
+  onBatchDeleteFiles?: (fileIds: string[]) => void;
+  onBatchMigrateTier?: (fileIds: string[], newTier: StorageTier) => void;
 }
 
+/**
+ * Maps BackendFileMetadata from FastAPI response to frontend StorageFile type
+ */
+const mapBackendFileToStorageFile = (bf: BackendFileMetadata): StorageFile => {
+  let inactivityDays = 0;
+  if (bf.last_accessed_timestamp) {
+    const lastAccessTime = new Date(bf.last_accessed_timestamp).getTime();
+    if (!isNaN(lastAccessTime)) {
+      inactivityDays = Math.max(0, Math.floor((Date.now() - lastAccessTime) / (1000 * 60 * 60 * 24)));
+    }
+  }
+
+  const validCategories: FileCategory[] = [
+    'Document', 'Image', 'Video', 'Audio', 'Archive', 'Code', 'Data', 'Other'
+  ];
+  const matchedCategory = validCategories.find(
+    (c) => c.toLowerCase() === (bf.category || '').toLowerCase()
+  ) || 'Other';
+
+  const validTiers: StorageTier[] = ['HOT', 'WARM', 'COLD', 'ARCHIVE'];
+  const upperTier = (bf.storage_tier || 'HOT').toUpperCase();
+  const matchedTier: StorageTier = validTiers.includes(upperTier as StorageTier)
+    ? (upperTier as StorageTier)
+    : 'HOT';
+
+  return {
+    id: String(bf.id),
+    filename: bf.filename,
+    file_size: bf.file_size_bytes,
+    mime_type: bf.mime_type || 'application/octet-stream',
+    category: matchedCategory,
+    storage_tier: matchedTier,
+    sha256_hash: bf.sha256_hash,
+    is_duplicate: Boolean(bf.is_duplicate),
+    original_file_id: bf.original_file_id ? String(bf.original_file_id) : null,
+    created_at: bf.upload_timestamp,
+    last_accessed_at: bf.last_accessed_timestamp,
+    inactivity_days: inactivityDays,
+  };
+};
+
 export const FileManagerView: React.FC<FileManagerViewProps> = ({
-  files,
+  files: _propFiles,
   onOpenUpload,
   onDeleteFile,
   onMigrateTier,
   onBatchDeleteFiles,
   onBatchMigrateTier,
-}) => {
+}): React.ReactElement => {
+  // Live backend data state
+  const [files, setFiles] = useState<StorageFile[]>([]);
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [error, setError] = useState<string | null>(null);
+
+  // Filter & Search state
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<string>('ALL');
   const [selectedTier, setSelectedTier] = useState<string>('ALL');
@@ -65,6 +115,26 @@ export const FileManagerView: React.FC<FileManagerViewProps> = ({
     'Other'
   ];
 
+  // Fetch actual files from GET /api/v1/files
+  const fetchFiles = useCallback(async () => {
+    setIsLoading(true);
+    setError(null);
+    try {
+      const response = await nexusApi.listFiles();
+      const mapped = (response.files || []).map(mapBackendFileToStorageFile);
+      setFiles(mapped);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Failed to retrieve storage objects from FastAPI backend.';
+      setError(message);
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchFiles();
+  }, [fetchFiles]);
+
   // Sorting Handler
   const handleSort = (field: SortField) => {
     if (sortField === field) {
@@ -83,6 +153,72 @@ export const FileManagerView: React.FC<FileManagerViewProps> = ({
     setSelectedTier('ALL');
     setShowDuplicatesOnly(false);
     setCurrentPage(1);
+  };
+
+  // Actions with Backend Integration
+  const handleDeleteFile = async (fileId: string) => {
+    const numId = Number(fileId);
+    if (!isNaN(numId)) {
+      try {
+        await nexusApi.deleteFile(numId);
+      } catch (err: unknown) {
+        console.error('Delete request failed:', err);
+      }
+    }
+    setFiles((prev) => prev.filter((f) => f.id !== fileId));
+    setSelectedIds((prev) => prev.filter((id) => id !== fileId));
+    onDeleteFile?.(fileId);
+  };
+
+  const handleMigrateTier = async (fileId: string, newTier: StorageTier) => {
+    const numId = Number(fileId);
+    if (!isNaN(numId)) {
+      try {
+        await nexusApi.updateFileTier(numId, newTier);
+      } catch (err: unknown) {
+        console.error('Tier update request failed:', err);
+      }
+    }
+    setFiles((prev) =>
+      prev.map((f) => (f.id === fileId ? { ...f, storage_tier: newTier } : f))
+    );
+    onMigrateTier?.(fileId, newTier);
+  };
+
+  const handleBatchDelete = async () => {
+    if (selectedIds.length === 0) return;
+    try {
+      await Promise.all(
+        selectedIds.map((id) => {
+          const numId = Number(id);
+          return !isNaN(numId) ? nexusApi.deleteFile(numId) : Promise.resolve();
+        })
+      );
+    } catch (err: unknown) {
+      console.error('Batch delete request failed:', err);
+    }
+    setFiles((prev) => prev.filter((f) => !selectedIds.includes(f.id)));
+    onBatchDeleteFiles?.(selectedIds);
+    setSelectedIds([]);
+  };
+
+  const handleBatchMigrate = async (newTier: StorageTier) => {
+    if (selectedIds.length === 0) return;
+    try {
+      await Promise.all(
+        selectedIds.map((id) => {
+          const numId = Number(id);
+          return !isNaN(numId) ? nexusApi.updateFileTier(numId, newTier) : Promise.resolve();
+        })
+      );
+    } catch (err: unknown) {
+      console.error('Batch tier migration failed:', err);
+    }
+    setFiles((prev) =>
+      prev.map((f) => (selectedIds.includes(f.id) ? { ...f, storage_tier: newTier } : f))
+    );
+    onBatchMigrateTier?.(selectedIds, newTier);
+    setSelectedIds([]);
   };
 
   // Filter & Sort Pipeline
@@ -171,6 +307,32 @@ export const FileManagerView: React.FC<FileManagerViewProps> = ({
 
   return (
     <div className="space-y-5">
+      {/* Error State Banner */}
+      {error && (
+        <div className="p-4 bg-rose-50 border border-rose-200 rounded-2xl flex items-start justify-between gap-4 animate-in fade-in">
+          <div className="flex items-start gap-3">
+            <div className="p-2 bg-rose-100 text-rose-600 rounded-xl shrink-0 mt-0.5">
+              <AlertCircle className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="text-sm font-bold text-rose-900">Backend Connection Error</h3>
+              <p className="text-xs text-rose-700 mt-0.5">{error}</p>
+              <p className="text-[11px] text-rose-500 mt-1">
+                Please verify that the FastAPI backend server is running at <code className="font-mono bg-rose-100/60 px-1 py-0.5 rounded">http://127.0.0.1:8000</code>.
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={fetchFiles}
+            disabled={isLoading}
+            className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold shadow-sm transition-all shrink-0 disabled:opacity-50"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin' : ''}`} />
+            <span>Retry Connection</span>
+          </button>
+        </div>
+      )}
+
       {/* Search & Filter Toolbar */}
       <div className="nexus-card p-4 space-y-3">
         <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
@@ -189,7 +351,7 @@ export const FileManagerView: React.FC<FileManagerViewProps> = ({
             />
           </div>
 
-          {/* Tier Filter, Duplicates Toggle & Ingest Button */}
+          {/* Tier Filter, Duplicates Toggle, Sync & Ingest Buttons */}
           <div className="flex items-center gap-2 shrink-0">
             <select
               value={selectedTier}
@@ -218,6 +380,16 @@ export const FileManagerView: React.FC<FileManagerViewProps> = ({
               }`}
             >
               Duplicates Only
+            </button>
+
+            <button
+              onClick={fetchFiles}
+              disabled={isLoading}
+              className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold border border-slate-200 shadow-sm transition-all disabled:opacity-50"
+              title="Sync with FastAPI backend"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin text-blue-600' : 'text-slate-500'}`} />
+              <span className="hidden sm:inline">Sync</span>
             </button>
 
             <button
@@ -270,10 +442,7 @@ export const FileManagerView: React.FC<FileManagerViewProps> = ({
             {(['HOT', 'WARM', 'COLD', 'ARCHIVE'] as StorageTier[]).map((t) => (
               <button
                 key={t}
-                onClick={() => {
-                  onBatchMigrateTier(selectedIds, t);
-                  setSelectedIds([]);
-                }}
+                onClick={() => handleBatchMigrate(t)}
                 className="px-2.5 py-1 text-[11px] font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-lg transition-colors"
               >
                 {t}
@@ -281,10 +450,7 @@ export const FileManagerView: React.FC<FileManagerViewProps> = ({
             ))}
 
             <button
-              onClick={() => {
-                onBatchDeleteFiles(selectedIds);
-                setSelectedIds([]);
-              }}
+              onClick={handleBatchDelete}
               className="flex items-center gap-1 px-3 py-1 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-xs font-bold transition-colors ml-2"
             >
               <Trash2 className="w-3.5 h-3.5" />
@@ -335,7 +501,8 @@ export const FileManagerView: React.FC<FileManagerViewProps> = ({
                     type="checkbox"
                     checked={isCurrentPageAllSelected}
                     onChange={(e) => handleSelectAll(e.target.checked)}
-                    className="w-3.5 h-3.5 rounded border-slate-300 text-blue-600 focus:ring-blue-500"
+                    disabled={isLoading || paginatedFiles.length === 0}
+                    className="w-3.5 h-3.5 rounded border-slate-300 text-blue-600 focus:ring-blue-500 disabled:opacity-40"
                   />
                 </th>
                 <th 
@@ -373,7 +540,34 @@ export const FileManagerView: React.FC<FileManagerViewProps> = ({
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {filteredAndSortedFiles.length === 0 ? (
+              {isLoading ? (
+                <tr>
+                  <td colSpan={8} className="py-16 text-center text-slate-400">
+                    <RefreshCw className="w-7 h-7 text-blue-600 animate-spin mx-auto mb-3" />
+                    <p className="font-semibold text-xs text-slate-700">Connecting to FastAPI Object Storage...</p>
+                    <p className="text-[11px] text-slate-400 mt-0.5">Fetching cryptographic hashes and storage tier telemetry</p>
+                  </td>
+                </tr>
+              ) : files.length === 0 && !error ? (
+                <tr>
+                  <td colSpan={8} className="py-16 text-center text-slate-400">
+                    <div className="w-12 h-12 rounded-2xl bg-blue-50 text-blue-600 flex items-center justify-center mx-auto mb-3">
+                      <HardDrive className="w-6 h-6" />
+                    </div>
+                    <p className="font-bold text-sm text-slate-700">Storage Bucket Initialized (0 Objects)</p>
+                    <p className="text-xs text-slate-400 mt-1 max-w-sm mx-auto">
+                      Your cloud storage bucket is currently empty. Ingest file objects to activate SHA-256 deduplication and lifecycle management.
+                    </p>
+                    <button
+                      onClick={onOpenUpload}
+                      className="mt-4 inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-xl shadow-sm transition-all"
+                    >
+                      <Upload className="w-3.5 h-3.5" />
+                      <span>Ingest First Object</span>
+                    </button>
+                  </td>
+                </tr>
+              ) : filteredAndSortedFiles.length === 0 ? (
                 <tr>
                   <td colSpan={8} className="py-12 text-center text-slate-400">
                     <AlertCircle className="w-8 h-8 mx-auto text-slate-300 mb-2" />
@@ -456,7 +650,7 @@ export const FileManagerView: React.FC<FileManagerViewProps> = ({
                       <td className="py-3.5 px-4 whitespace-nowrap">
                         {file.is_duplicate ? (
                           <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-amber-50 text-amber-700 border border-amber-200">
-                            <Copy className="w-3 h-3" /> Duplicate
+                            <Copy className="w-3.5 h-3.5" /> Duplicate
                           </span>
                         ) : (
                           <span className="text-[11px] text-slate-400">Primary</span>
@@ -475,9 +669,9 @@ export const FileManagerView: React.FC<FileManagerViewProps> = ({
                           </button>
 
                           <button
-                            onClick={() => onDeleteFile(file.id)}
+                            onClick={() => handleDeleteFile(file.id)}
                             className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition-colors"
-                            title="Simulate Delete"
+                            title="Delete Object"
                           >
                             <Trash2 className="w-4 h-4" />
                           </button>
@@ -558,7 +752,7 @@ export const FileManagerView: React.FC<FileManagerViewProps> = ({
       <FileDetailsModal
         file={selectedFileForModal}
         onClose={() => setSelectedFileForModal(null)}
-        onMigrateTier={onMigrateTier}
+        onMigrateTier={handleMigrateTier}
       />
     </div>
   );

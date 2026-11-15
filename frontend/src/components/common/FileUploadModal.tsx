@@ -1,14 +1,56 @@
 import React, { useState } from 'react';
-import { X, UploadCloud, File, Info, Hash, HardDrive } from 'lucide-react';
-import { StorageTier, StorageFile } from '../../types';
+import { X, UploadCloud, File, Info, Hash, HardDrive, Loader2, AlertCircle } from 'lucide-react';
+import { StorageTier, StorageFile, FileCategory } from '../../types';
 import { TierBadge } from './TierBadge';
 import { formatBytes } from '../../data/mockData';
+import { nexusApi, BackendFileMetadata } from '../../services/api';
 
 interface FileUploadModalProps {
   isOpen: boolean;
   onClose: () => void;
   onFileUploaded: (file: StorageFile) => void;
 }
+
+/**
+ * Maps BackendFileMetadata from FastAPI response to frontend StorageFile type
+ */
+const mapBackendFileToStorageFile = (bf: BackendFileMetadata): StorageFile => {
+  let inactivityDays = 0;
+  if (bf.last_accessed_timestamp) {
+    const lastAccessTime = new Date(bf.last_accessed_timestamp).getTime();
+    if (!isNaN(lastAccessTime)) {
+      inactivityDays = Math.max(0, Math.floor((Date.now() - lastAccessTime) / (1000 * 60 * 60 * 24)));
+    }
+  }
+
+  const validCategories: FileCategory[] = [
+    'Document', 'Image', 'Video', 'Audio', 'Archive', 'Code', 'Data', 'Other'
+  ];
+  const matchedCategory = validCategories.find(
+    (c) => c.toLowerCase() === (bf.category || '').toLowerCase()
+  ) || 'Other';
+
+  const validTiers: StorageTier[] = ['HOT', 'WARM', 'COLD', 'ARCHIVE'];
+  const upperTier = (bf.storage_tier || 'HOT').toUpperCase();
+  const matchedTier: StorageTier = validTiers.includes(upperTier as StorageTier)
+    ? (upperTier as StorageTier)
+    : 'HOT';
+
+  return {
+    id: String(bf.id),
+    filename: bf.filename,
+    file_size: bf.file_size_bytes,
+    mime_type: bf.mime_type || 'application/octet-stream',
+    category: matchedCategory,
+    storage_tier: matchedTier,
+    sha256_hash: bf.sha256_hash,
+    is_duplicate: Boolean(bf.is_duplicate),
+    original_file_id: bf.original_file_id ? String(bf.original_file_id) : null,
+    created_at: bf.upload_timestamp,
+    last_accessed_at: bf.last_accessed_timestamp,
+    inactivity_days: inactivityDays,
+  };
+};
 
 export const FileUploadModal: React.FC<FileUploadModalProps> = ({
   isOpen,
@@ -17,70 +59,62 @@ export const FileUploadModal: React.FC<FileUploadModalProps> = ({
 }) => {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [selectedTier, setSelectedTier] = useState<StorageTier>('HOT');
-  const [isSimulating, setIsSimulating] = useState(false);
-  const [simulatedProgress, setSimulatedProgress] = useState(0);
-  const [simulatedHash, setSimulatedHash] = useState<string>('');
+  const [isUploading, setIsUploading] = useState<boolean>(false);
+  const [isComputingHash, setIsComputingHash] = useState<boolean>(false);
+  const [fileHash, setFileHash] = useState<string>('');
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   if (!isOpen) return null;
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    setErrorMessage(null);
     if (e.target.files && e.target.files[0]) {
       const file = e.target.files[0];
       setSelectedFile(file);
-      // Generate a mock SHA-256 for visual preview
-      const mockHash = Array.from({ length: 64 }, () => 
-        Math.floor(Math.random() * 16).toString(16)
-      ).join('');
-      setSimulatedHash(mockHash);
+      setIsComputingHash(true);
+      setFileHash('');
+
+      try {
+        const buffer = await file.arrayBuffer();
+        const digest = await crypto.subtle.digest('SHA-256', buffer);
+        const hashArray = Array.from(new Uint8Array(digest));
+        const hashHex = hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
+        setFileHash(hashHex);
+      } catch {
+        setFileHash('');
+      } finally {
+        setIsComputingHash(false);
+      }
     }
   };
 
-  const handleSimulatedUpload = () => {
-    if (!selectedFile) return;
+  const handleRealUpload = async () => {
+    if (!selectedFile || isUploading) return;
 
-    setIsSimulating(true);
-    setSimulatedProgress(15);
+    setIsUploading(true);
+    setErrorMessage(null);
 
-    const interval = setInterval(() => {
-      setSimulatedProgress((prev) => {
-        if (prev >= 90) {
-          clearInterval(interval);
-          setTimeout(() => {
-            setIsSimulating(false);
-            setSimulatedProgress(100);
+    try {
+      const backendMetadata = await nexusApi.uploadFile(selectedFile, selectedTier);
+      const mappedFile = mapBackendFileToStorageFile(backendMetadata);
+      onFileUploaded(mappedFile);
+      setSelectedFile(null);
+      setFileHash('');
+      onClose();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Failed to ingest file object to FastAPI backend.';
+      setErrorMessage(message);
+    } finally {
+      setIsUploading(false);
+    }
+  };
 
-            // Determine category from extension
-            const ext = selectedFile.name.split('.').pop()?.toLowerCase() || '';
-            let category: StorageFile['category'] = 'Other';
-            if (['pdf', 'docx', 'txt', 'log'].includes(ext)) category = 'Document';
-            else if (['jpg', 'jpeg', 'png', 'svg', 'ai'].includes(ext)) category = 'Image';
-            else if (['mp4', 'mov', 'avi'].includes(ext)) category = 'Video';
-            else if (['zip', 'tar', 'gz', '7z'].includes(ext)) category = 'Archive';
-            else if (['py', 'ts', 'js', 'json', 'yaml'].includes(ext)) category = 'Code';
-            else if (['csv', 'sql', 'parquet', 'db'].includes(ext)) category = 'Data';
-
-            const newFile: StorageFile = {
-              id: `f-${Date.now().toString().slice(-4)}`,
-              filename: selectedFile.name,
-              file_size: selectedFile.size || 1024 * 1024 * 4.5, // fallback if 0
-              mime_type: selectedFile.type || 'application/octet-stream',
-              category,
-              storage_tier: selectedTier,
-              sha256_hash: simulatedHash,
-              is_duplicate: false,
-              created_at: new Date().toISOString(),
-              last_accessed_at: new Date().toISOString(),
-              inactivity_days: 0,
-            };
-
-            onFileUploaded(newFile);
-            onClose();
-          }, 400);
-          return 100;
-        }
-        return prev + 25;
-      });
-    }, 120);
+  const handleModalClose = () => {
+    if (isUploading) return;
+    setSelectedFile(null);
+    setFileHash('');
+    setErrorMessage(null);
+    onClose();
   };
 
   return (
@@ -90,11 +124,12 @@ export const FileUploadModal: React.FC<FileUploadModalProps> = ({
         <div className="flex items-center justify-between px-6 py-4 border-b border-slate-100 bg-slate-50/60">
           <div>
             <h3 className="text-base font-bold text-slate-900">Ingest New File Object</h3>
-            <p className="text-xs text-slate-500">Upload to simulated cloud storage bucket</p>
+            <p className="text-xs text-slate-500">Upload to live NEXUS cloud storage bucket</p>
           </div>
           <button 
-            onClick={onClose}
-            className="p-1 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-colors"
+            onClick={handleModalClose}
+            disabled={isUploading}
+            className="p-1 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-colors disabled:opacity-50"
           >
             <X className="w-5 h-5" />
           </button>
@@ -106,12 +141,27 @@ export const FileUploadModal: React.FC<FileUploadModalProps> = ({
           <div className="flex items-start gap-3 p-3 text-xs bg-blue-50/80 border border-blue-200/60 rounded-xl text-blue-800">
             <Info className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
             <div>
-              <span className="font-semibold">Simulated Ingestion Interface:</span> Generates client-side SHA-256 fingerprinting. Future API mode streams directly to FastAPI endpoint <code className="bg-blue-100/80 px-1 py-0.5 rounded font-mono">/api/v1/files/upload</code>.
+              <span className="font-semibold">Live Storage Ingestion:</span> Streams file directly to FastAPI backend <code className="bg-blue-100/80 px-1 py-0.5 rounded font-mono">/api/v1/files/upload</code> with real-time SHA-256 deduplication and categorization.
             </div>
           </div>
 
+          {/* Error Message if upload failed */}
+          {errorMessage && (
+            <div className="flex items-start gap-2.5 p-3 text-xs bg-red-50 border border-red-200 rounded-xl text-red-700 animate-in fade-in">
+              <AlertCircle className="w-4 h-4 text-red-500 shrink-0 mt-0.5" />
+              <div className="flex-1">
+                <span className="font-semibold">Ingestion Failed: </span>
+                <span>{errorMessage}</span>
+              </div>
+            </div>
+          )}
+
           {/* Drag & Drop Zone */}
-          <label className="flex flex-col items-center justify-center border-2 border-dashed border-slate-300 hover:border-blue-500 rounded-xl p-6 cursor-pointer bg-slate-50/50 hover:bg-blue-50/20 transition-all group">
+          <label className={`flex flex-col items-center justify-center border-2 border-dashed rounded-xl p-6 cursor-pointer transition-all group ${
+            isUploading 
+              ? 'border-slate-200 bg-slate-50/50 cursor-not-allowed opacity-60' 
+              : 'border-slate-300 hover:border-blue-500 bg-slate-50/50 hover:bg-blue-50/20'
+          }`}>
             <div className="p-3 bg-white group-hover:bg-blue-50 rounded-full shadow-sm border border-slate-200/80 text-blue-600 mb-3 transition-colors">
               <UploadCloud className="w-6 h-6" />
             </div>
@@ -119,13 +169,13 @@ export const FileUploadModal: React.FC<FileUploadModalProps> = ({
               {selectedFile ? selectedFile.name : 'Click to select or drag and drop a file'}
             </p>
             <p className="text-xs text-slate-400 mt-1">
-              Supports SQL dumps, logs, media, documents, archives (up to 100 GB)
+              Supports documents, images, video, archives, code, and data dumps
             </p>
             <input 
               type="file" 
               className="hidden" 
               onChange={handleFileChange}
-              disabled={isSimulating}
+              disabled={isUploading}
             />
           </label>
 
@@ -141,7 +191,9 @@ export const FileUploadModal: React.FC<FileUploadModalProps> = ({
               </div>
               <div className="flex items-center gap-1.5 text-[11px] text-slate-500 font-mono truncate">
                 <Hash className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                <span className="truncate">SHA-256: {simulatedHash}</span>
+                <span className="truncate">
+                  {isComputingHash ? 'Calculating cryptographic SHA-256...' : `SHA-256: ${fileHash || 'Available upon ingest'}`}
+                </span>
               </div>
             </div>
           )}
@@ -157,12 +209,13 @@ export const FileUploadModal: React.FC<FileUploadModalProps> = ({
                 <button
                   key={tier}
                   type="button"
+                  disabled={isUploading}
                   onClick={() => setSelectedTier(tier)}
                   className={`flex items-center justify-between p-2.5 rounded-lg border text-left transition-all ${
                     selectedTier === tier 
                       ? 'border-blue-600 bg-blue-50/50 ring-1 ring-blue-600' 
                       : 'border-slate-200 hover:border-slate-300 bg-white'
-                  }`}
+                  } disabled:opacity-50`}
                 >
                   <TierBadge tier={tier} size="sm" />
                   <span className="text-[11px] font-mono text-slate-500">
@@ -173,18 +226,17 @@ export const FileUploadModal: React.FC<FileUploadModalProps> = ({
             </div>
           </div>
 
-          {/* Progress Bar when uploading */}
-          {isSimulating && (
+          {/* Uploading Status Bar */}
+          {isUploading && (
             <div className="space-y-1.5 animate-in fade-in">
               <div className="flex justify-between text-xs text-slate-600">
-                <span>Calculating hash & storing chunk streams...</span>
-                <span className="font-mono font-medium">{simulatedProgress}%</span>
+                <span className="flex items-center gap-1.5 font-medium">
+                  <Loader2 className="w-3.5 h-3.5 text-blue-600 animate-spin" />
+                  Streaming blob to FastAPI backend & auditing duplicates...
+                </span>
               </div>
               <div className="w-full bg-slate-100 rounded-full h-2 overflow-hidden">
-                <div 
-                  className="bg-blue-600 h-2 rounded-full transition-all duration-200"
-                  style={{ width: `${simulatedProgress}%` }}
-                />
+                <div className="bg-blue-600 h-2 rounded-full w-full animate-pulse" />
               </div>
             </div>
           )}
@@ -194,20 +246,29 @@ export const FileUploadModal: React.FC<FileUploadModalProps> = ({
         <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-slate-100 bg-slate-50/60">
           <button
             type="button"
-            onClick={onClose}
-            disabled={isSimulating}
-            className="px-4 py-2 text-xs font-semibold text-slate-600 hover:text-slate-800 hover:bg-slate-200/60 rounded-lg transition-colors"
+            onClick={handleModalClose}
+            disabled={isUploading}
+            className="px-4 py-2 text-xs font-semibold text-slate-600 hover:text-slate-800 hover:bg-slate-200/60 rounded-lg transition-colors disabled:opacity-50"
           >
             Cancel
           </button>
           <button
             type="button"
-            onClick={handleSimulatedUpload}
-            disabled={!selectedFile || isSimulating}
+            onClick={handleRealUpload}
+            disabled={!selectedFile || isUploading || isComputingHash}
             className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:pointer-events-none rounded-lg shadow-sm transition-colors"
           >
-            <HardDrive className="w-4 h-4" />
-            <span>{isSimulating ? 'Ingesting...' : 'Ingest to Cloud Storage'}</span>
+            {isUploading ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin" />
+                <span>Ingesting Blob...</span>
+              </>
+            ) : (
+              <>
+                <HardDrive className="w-4 h-4" />
+                <span>Ingest to Cloud Storage</span>
+              </>
+            )}
           </button>
         </div>
       </div>

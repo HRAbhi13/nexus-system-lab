@@ -10,14 +10,14 @@ interface HeaderProps {
   activeTab: ActiveNavTab;
   onOpenUpload: () => void;
   onNavigateToTab: (tab: ActiveNavTab) => void;
-  healthScore?: number;
+  healthScore?: number | null;
 }
 
 export const Header: React.FC<HeaderProps> = ({
   activeTab,
   onOpenUpload,
   onNavigateToTab,
-  healthScore = 79,
+  healthScore = null,
 }) => {
   const titles: Record<ActiveNavTab, { title: string; subtitle: string }> = {
     overview: { title: 'Executive Overview', subtitle: 'Storage utilization, cost metrics, and optimization telemetry' },
@@ -48,17 +48,17 @@ export const Header: React.FC<HeaderProps> = ({
         {/* Cloud Region Pill */}
         <div className="hidden lg:flex items-center gap-1.5 px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs font-medium text-slate-700">
           <Globe className="w-3.5 h-3.5 text-blue-600" />
-          <span>Simulated US-East-1 (S3 Engine)</span>
+          <span>Local Cloud Bucket (FastAPI)</span>
         </div>
 
-        {/* Health Score Pill */}
+        {/* Optimization Health Pill (Derived storage efficiency indicator) */}
         <div 
           onClick={() => onNavigateToTab('analytics')}
           className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-emerald-50 border border-emerald-200/80 text-emerald-800 text-xs font-semibold cursor-pointer hover:bg-emerald-100/60 transition-colors"
-          title="Calculated efficiency score based on duplicate removal and tier distribution"
+          title="Derived storage optimization score based on duplicate redundancy and compression overhead (Click to inspect in Analytics)"
         >
           <Sparkles className="w-3.5 h-3.5 text-emerald-600" />
-          <span>Health: {healthScore}/100</span>
+          <span>{healthScore !== null && healthScore !== undefined ? `Opt. Health: ${healthScore}/100` : 'Telemetry Active'}</span>
         </div>
 
         {/* Upload Action Button */}

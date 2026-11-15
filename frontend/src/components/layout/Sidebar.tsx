@@ -128,7 +128,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
         <div className="flex items-center justify-between px-1 text-[11px] text-slate-500">
           <span>College Engineering Lab</span>
-          <span className="text-slate-400 font-mono">Simulated S3</span>
+          <span className="text-slate-400 font-mono">Local Cloud</span>
         </div>
       </div>
     </aside>

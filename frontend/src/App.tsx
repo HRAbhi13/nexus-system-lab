@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Sidebar } from './components/layout/Sidebar';
 import { Header } from './components/layout/Header';
 import { OverviewView } from './components/views/OverviewView';
@@ -10,24 +10,69 @@ import { AnalyticsView } from './components/views/AnalyticsView';
 import { SettingsView } from './components/views/SettingsView';
 import { FileUploadModal } from './components/common/FileUploadModal';
 import { NotificationToast, ToastMessage } from './components/common/NotificationToast';
-import { 
-  MOCK_FILES, 
-  MOCK_DUPLICATE_GROUPS, 
-  MOCK_COMPRESSION_CANDIDATES, 
-  MOCK_TIER_RECOMMENDATIONS, 
-  formatBytes 
-} from './data/mockData';
-import { ActiveNavTab, StorageFile, StorageTier } from './types';
+import { nexusApi } from './services/api';
+import { ActiveNavTab, StorageFile } from './types';
+
+/**
+ * Format raw bytes into human-readable representation
+ */
+const formatBytes = (bytes: number, decimals: number = 2): string => {
+  if (bytes === 0) return '0 B';
+  const k = 1024;
+  const dm = decimals < 0 ? 0 : decimals;
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  const i = Math.floor(Math.log(Math.max(1, bytes)) / Math.log(k));
+  return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i] || 'B'}`;
+};
 
 export const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<ActiveNavTab>('overview');
-  const [files, setFiles] = useState<StorageFile[]>(MOCK_FILES);
-  const [duplicateGroups, setDuplicateGroups] = useState(MOCK_DUPLICATE_GROUPS);
-  const [compressionCandidates, setCompressionCandidates] = useState(MOCK_COMPRESSION_CANDIDATES);
-  const [tierRecommendations, setTierRecommendations] = useState(MOCK_TIER_RECOMMENDATIONS);
-  
+
+  // Dynamic badge and health counts powered by live backend telemetry
+  const [duplicateCount, setDuplicateCount] = useState<number>(0);
+  const [compressionCount, setCompressionCount] = useState<number>(0);
+  const [recommendationCount, setRecommendationCount] = useState<number>(0);
+  const [healthScore, setHealthScore] = useState<number | null>(null);
+
   const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
+  const [dataVersion, setDataVersion] = useState<number>(0);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
+
+  // Fetch live global telemetry for sidebar badges and header health
+  useEffect(() => {
+    let isMounted = true;
+    async function loadGlobalTelemetry() {
+      try {
+        const [dash, roi] = await Promise.all([
+          nexusApi.getStorageDashboard(),
+          nexusApi.getOptimizationRoi(),
+        ]);
+        if (!isMounted) return;
+
+        setDuplicateCount(roi.duplicate_files_count || 0);
+        setCompressionCount(roi.compressible_files_count || 0);
+        setRecommendationCount(roi.tier_transition_candidates_count || 0);
+
+        if (dash.overview.total_files === 0) {
+          setHealthScore(100);
+        } else {
+          const dupPenalty = (dash.overview.duplicate_volume_percentage || 0) * 0.5;
+          const savingsPenalty = (roi.overall_projected_savings_percentage || 0) * 0.5;
+          const score = Math.max(10, Math.min(100, Math.round(100 - dupPenalty - savingsPenalty)));
+          setHealthScore(score);
+        }
+      } catch {
+        if (isMounted) {
+          setHealthScore(null);
+        }
+      }
+    }
+
+    loadGlobalTelemetry();
+    return () => {
+      isMounted = false;
+    };
+  }, [dataVersion]);
 
   // Toast notification helper
   const addToast = (type: 'success' | 'info' | 'warning', title: string, message: string) => {
@@ -42,175 +87,15 @@ export const App: React.FC = () => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   };
 
-  // Actions
+  // Callback when a real file is ingested via the upload modal
   const handleFileUploaded = (newFile: StorageFile) => {
-    setFiles((prev) => [newFile, ...prev]);
+    setDataVersion((prev) => prev + 1);
     addToast(
       'success',
-      'Blob Object Ingested',
-      `Simulated upload of "${newFile.filename}" (${formatBytes(newFile.file_size)}) to ${newFile.storage_tier} tier.`
-    );
-  };
-
-  const handleDeleteFile = (fileId: string) => {
-    const target = files.find((f) => f.id === fileId);
-    setFiles((prev) => prev.filter((f) => f.id !== fileId));
-    setDuplicateGroups((prev) => 
-      prev.map((g) => ({
-        ...g,
-        duplicates: g.duplicates.filter((d) => d.id !== fileId),
-      })).filter((g) => g.duplicates.length > 0)
-    );
-    setCompressionCandidates((prev) => prev.filter((c) => c.file.id !== fileId));
-    setTierRecommendations((prev) => prev.filter((r) => r.file.id !== fileId));
-
-    addToast(
-      'info',
-      'Storage Object Deleted',
-      `Deleted file "${target?.filename || fileId}". Reclaimed ${target ? formatBytes(target.file_size) : 'storage'}.`
-    );
-  };
-
-  const handleMigrateTier = (fileId: string, newTier: StorageTier) => {
-    setFiles((prev) => 
-      prev.map((f) => f.id === fileId ? { ...f, storage_tier: newTier } : f)
-    );
-    setTierRecommendations((prev) => prev.filter((r) => r.file.id !== fileId));
-    addToast(
-      'success',
-      'Storage Tier Transitioned',
-      `Object successfully migrated to ${newTier} storage tier.`
-    );
-  };
-
-  const handleBatchMigrateTier = (fileIds: string[], newTier: StorageTier) => {
-    setFiles((prev) => 
-      prev.map((f) => fileIds.includes(f.id) ? { ...f, storage_tier: newTier } : f)
-    );
-    setTierRecommendations((prev) => prev.filter((r) => !fileIds.includes(r.file.id)));
-    addToast(
-      'success',
-      'Batch Tier Migration',
-      `Migrated ${fileIds.length} objects to ${newTier} storage tier.`
-    );
-  };
-
-  const handleBatchDeleteFiles = (fileIds: string[]) => {
-    setFiles((prev) => prev.filter((f) => !fileIds.includes(f.id)));
-    setDuplicateGroups((prev) => 
-      prev.map((g) => ({
-        ...g,
-        duplicates: g.duplicates.filter((d) => !fileIds.includes(d.id)),
-      })).filter((g) => g.duplicates.length > 0)
-    );
-    setCompressionCandidates((prev) => prev.filter((c) => !fileIds.includes(c.file.id)));
-    setTierRecommendations((prev) => prev.filter((r) => !fileIds.includes(r.file.id)));
-    addToast(
-      'info',
-      'Batch Deletion Completed',
-      `Deleted ${fileIds.length} file objects from storage.`
-    );
-  };
-
-  const handleDeleteSingleDuplicate = (fileId: string, hash: string) => {
-    setFiles((prev) => prev.filter((f) => f.id !== fileId));
-    setDuplicateGroups((prev) =>
-      prev.map((g) => {
-        if (g.hash !== hash) return g;
-        const updatedDuplicates = g.duplicates.filter((d) => d.id !== fileId);
-        const wasted = updatedDuplicates.reduce((sum, d) => sum + d.file_size, 0);
-        return {
-          ...g,
-          duplicates: updatedDuplicates,
-          total_wasted_bytes: wasted,
-          count: updatedDuplicates.length + 1,
-        };
-      }).filter((g) => g.duplicates.length > 0)
-    );
-    addToast('info', 'Duplicate Copy Removed', 'Specific redundant replica was purged.');
-  };
-
-  const handleDeduplicateGroup = (hash: string) => {
-    const group = duplicateGroups.find((g) => g.hash === hash);
-    if (!group) return;
-
-    const dupIds = group.duplicates.map((d) => d.id);
-    setFiles((prev) => prev.filter((f) => !dupIds.includes(f.id)));
-    setDuplicateGroups((prev) => prev.filter((g) => g.hash !== hash));
-
-    addToast(
-      'success',
-      'Cluster Deduplicated',
-      `Purged ${dupIds.length} redundant copies. Reclaimed ${formatBytes(group.total_wasted_bytes)} of storage.`
-    );
-  };
-
-  const handleDeduplicateAll = () => {
-    const allDupIds = duplicateGroups.flatMap((g) => g.duplicates.map((d) => d.id));
-    const totalWasted = duplicateGroups.reduce((acc, g) => acc + g.total_wasted_bytes, 0);
-
-    setFiles((prev) => prev.filter((f) => !allDupIds.includes(f.id)));
-    setDuplicateGroups([]);
-
-    addToast(
-      'success',
-      'Global Deduplication Complete',
-      `Purged all ${allDupIds.length} redundant copies across all clusters. Reclaimed ${formatBytes(totalWasted)}.`
-    );
-  };
-
-  const handleCompressCandidate = (fileId: string) => {
-    const candidate = compressionCandidates.find((c) => c.file.id === fileId);
-    if (!candidate) return;
-
-    // Simulate shrinking the file in state
-    setFiles((prev) => 
-      prev.map((f) => 
-        f.id === fileId 
-          ? { ...f, file_size: candidate.estimated_compressed_bytes } 
-          : f
-      )
-    );
-    setCompressionCandidates((prev) => prev.filter((c) => c.file.id !== fileId));
-
-    addToast(
-      'success',
-      'Object Compressed',
-      `Applied ${candidate.recommended_algorithm} compression. Saved ${formatBytes(candidate.estimated_saved_bytes)}.`
-    );
-  };
-
-  const handleCompressAll = () => {
-    const totalSaved = compressionCandidates.reduce((acc, c) => acc + c.estimated_saved_bytes, 0);
-    setFiles((prev) => 
-      prev.map((f) => {
-        const cand = compressionCandidates.find((c) => c.file.id === f.id);
-        return cand ? { ...f, file_size: cand.estimated_compressed_bytes } : f;
-      })
-    );
-    setCompressionCandidates([]);
-
-    addToast(
-      'success',
-      'Batch Compression Completed',
-      `Successfully compressed all candidates. Reclaimed ${formatBytes(totalSaved)} storage capacity.`
-    );
-  };
-
-  const handleApplyAllRecommendations = () => {
-    setFiles((prev) => 
-      prev.map((f) => {
-        const rec = tierRecommendations.find((r) => r.file.id === f.id);
-        return rec ? { ...f, storage_tier: rec.recommended_tier } : f;
-      })
-    );
-    const count = tierRecommendations.length;
-    setTierRecommendations([]);
-
-    addToast(
-      'success',
-      'All Lifecycle Rules Applied',
-      `Migrated ${count} objects to optimal WARM, COLD and ARCHIVE tiers based on inactivity.`
+      newFile.is_duplicate ? 'Duplicate Object Ingested' : 'Storage Object Ingested',
+      newFile.is_duplicate
+        ? `Uploaded duplicate copy "${newFile.filename}" (${formatBytes(newFile.file_size)}). Linked to master file (ID: ${newFile.original_file_id || 'N/A'}).`
+        : `Successfully ingested "${newFile.filename}" (${formatBytes(newFile.file_size)}) to ${newFile.storage_tier} tier.`
     );
   };
 
@@ -220,9 +105,9 @@ export const App: React.FC = () => {
       <Sidebar
         activeTab={activeTab}
         onTabChange={setActiveTab}
-        duplicateCount={duplicateGroups.length}
-        compressionCount={compressionCandidates.length}
-        recommendationCount={tierRecommendations.length}
+        duplicateCount={duplicateCount}
+        compressionCount={compressionCount}
+        recommendationCount={recommendationCount}
       />
 
       {/* Main Container */}
@@ -232,60 +117,55 @@ export const App: React.FC = () => {
           activeTab={activeTab}
           onOpenUpload={() => setIsUploadModalOpen(true)}
           onNavigateToTab={setActiveTab}
-          healthScore={79}
+          healthScore={healthScore}
         />
 
         {/* Dynamic View Scrollable Area */}
         <main className="flex-1 overflow-y-auto p-6 md:p-8">
           <div className="max-w-7xl mx-auto">
             {activeTab === 'overview' && (
-              <OverviewView 
-                onNavigate={setActiveTab} 
-                onOpenUpload={() => setIsUploadModalOpen(true)} 
+              <OverviewView
+                key={`overview-${dataVersion}`}
+                onNavigate={setActiveTab}
+                onOpenUpload={() => setIsUploadModalOpen(true)}
               />
             )}
 
             {activeTab === 'files' && (
               <FileManagerView
-                files={files}
+                key={`files-${dataVersion}`}
                 onOpenUpload={() => setIsUploadModalOpen(true)}
-                onDeleteFile={handleDeleteFile}
-                onMigrateTier={handleMigrateTier}
-                onBatchDeleteFiles={handleBatchDeleteFiles}
-                onBatchMigrateTier={handleBatchMigrateTier}
               />
             )}
 
             {activeTab === 'duplicates' && (
               <DuplicateDetectionView
-                groups={duplicateGroups}
-                onDeduplicateGroup={handleDeduplicateGroup}
-                onDeduplicateAll={handleDeduplicateAll}
-                onDeleteSingleDuplicate={handleDeleteSingleDuplicate}
+                key={`duplicates-${dataVersion}`}
               />
             )}
 
             {activeTab === 'compression' && (
               <CompressionAdvisorView
-                candidates={compressionCandidates}
-                onCompressCandidate={handleCompressCandidate}
-                onCompressAll={handleCompressAll}
+                key={`compression-${dataVersion}`}
               />
             )}
 
             {activeTab === 'optimizer' && (
               <StorageOptimizerView
-                recommendations={tierRecommendations}
-                onApplyRecommendation={handleMigrateTier}
-                onApplyAllRecommendations={handleApplyAllRecommendations}
+                key={`optimizer-${dataVersion}`}
               />
             )}
 
-            {activeTab === 'analytics' && <AnalyticsView />}
+            {activeTab === 'analytics' && (
+              <AnalyticsView
+                key={`analytics-${dataVersion}`}
+              />
+            )}
 
             {activeTab === 'settings' && (
-              <SettingsView 
-                onSavePreferences={(msg) => addToast('success', 'Preferences Updated', msg)} 
+              <SettingsView
+                key={`settings-${dataVersion}`}
+                onSavePreferences={(msg) => addToast('success', 'Preferences Updated', msg)}
               />
             )}
           </div>
